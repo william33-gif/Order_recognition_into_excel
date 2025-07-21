@@ -1,34 +1,75 @@
 "use client";
 import Image from "next/image";
 import { useState } from "react";
-import Tesseract from "tesseract.js";
+import axios from "axios";
 import * as XLSX from "xlsx";
 import { saveAs } from "file-saver";
 
 function extractInfo(text) {
-  // 1. 优先查找“优 惠 后”或“实 付”中间可有空格的金额
-  const discountMatch = text.match(/优\s*惠\s*后[：: ]*([¥￥Y]?\s*\d{2,6}(?:\.\d{1,2})?)/);
-  if (discountMatch) {
-    return {
-      amount: discountMatch[1].replace(/[¥￥Y\s]/g, ''),
-      orderId: (text.match(/\b\d{13,}\b/) || [])[0] || "未识别"
-    };
+  // 1. 优惠后金额（商品金额）增强提取逻辑
+  let amountDiscount = "未识别";
+  const lines = text.split(/\r?\n/);
+  // 1.1 优先找“优惠后”关键词
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes('优惠后')) {
+      let match = lines[i].match(/([¥￥Y]?[\s]*\d{2,6}(?:\.\d{1,2})?)/);
+      if (match && /\d/.test(match[0])) {
+        amountDiscount = match[0].replace(/[¥￥Y\s]/g, '');
+        break;
+      }
+      // 兼容金额在下一行
+      if (i + 1 < lines.length) {
+        let matchNext = lines[i + 1].match(/([¥￥Y]?[\s]*\d{2,6}(?:\.\d{1,2})?)/);
+        if (matchNext && /\d/.test(matchNext[0])) {
+          amountDiscount = matchNext[0].replace(/[¥￥Y\s]/g, '');
+          break;
+        }
+      }
+    }
   }
-  const paidMatch = text.match(/实\s*付[：: ]*([¥￥Y]?\s*\d{2,6}(?:\.\d{1,2})?)/);
-  if (paidMatch) {
-    return {
-      amount: paidMatch[1].replace(/[¥￥Y\s]/g, ''),
-      orderId: (text.match(/\b\d{13,}\b/) || [])[0] || "未识别"
-    };
+  // 1.2 没有“优惠后”时，找商品区靠右的金额，排除“实付”相关行
+  if (amountDiscount === "未识别") {
+    for (let i = 0; i < lines.length; i++) {
+      if (/实付|微信|订单|编号|下单|发票|快照|金额|运费|礼金|减|共减|支付|退款|价保|发货/.test(lines[i])) continue;
+      // 只考虑带有“¥”或“￥”的金额
+      let match = lines[i].match(/([¥￥Y][\s]*\d{2,6}(?:\.\d{1,2})?)/);
+      if (match && /\d/.test(match[0])) {
+        amountDiscount = match[0].replace(/[¥￥Y\s]/g, '');
+        break;
+      }
+    }
   }
-  // 2. 其次查找所有“¥”/“￥”/“Y”后面的金额（2-6位数字），只取最靠前的
-  const symbolMatch = text.match(/[¥￥Y]\s*(\d{2,6}(?:\.\d{1,2})?)/);
-  const amountVal = symbolMatch?.[1] || "未识别";
-  const orderIdMatch = text.match(/\b\d{13,}\b/);
+  // 2. 实付金额（红框）跨行提取
+  let amountPaid = "未识别";
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes('实付')) {
+      let match = lines[i].match(/([¥￥Y]?\s*\d{2,6}(?:\.\d{1,2})?)/);
+      if (match && /\d/.test(match[0])) {
+        amountPaid = match[0].replace(/[¥￥Y\s]/g, '');
+        break;
+      }
+      if (i + 1 < lines.length) {
+        let matchNext = lines[i + 1].match(/([¥￥Y]?\s*\d{2,6}(?:\.\d{1,2})?)/);
+        if (matchNext && /\d/.test(matchNext[0])) {
+          amountPaid = matchNext[0].replace(/[¥￥Y\s]/g, '');
+          break;
+        }
+      }
+    }
+  }
   return {
-    amount: amountVal,
-    orderId: orderIdMatch ? orderIdMatch[0] : "未识别"
+    amountDiscount,
+    amountPaid,
+    orderId: extractOrderIdWithLimit(text)
   };
+}
+
+function extractOrderIdWithLimit(text) {
+  const match = text.match(/\b\d{13,}\b/);
+  if (match && match[0]) {
+    return match[0].slice(0, 14); // 只取前14位
+  }
+  return "未识别";
 }
 
 export default function Home() {
@@ -47,43 +88,68 @@ export default function Home() {
     setProgress(0);
   };
 
+  // 新的批量识别逻辑，调用后端API
   const handleOcrAll = async () => {
     setLoading(true);
     setResults([]);
     setSingleRawText("");
-    let tempResults = [];
-    for (let i = 0; i < files.length; i++) {
-      try {
-        const { data: { text } } = await Tesseract.recognize(files[i], 'chi_sim');
+    setProgress(0);
+
+    // 1. 读取所有图片为base64
+    const getBase64List = (files) => {
+      return Promise.all(
+        files.map(file => {
+          return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = e => resolve(e.target.result.split(',')[1]); // 只要base64部分
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+          });
+        })
+      );
+    };
+
+    try {
+      const base64List = await getBase64List(files);
+      // 2. 调用后端API
+      const res = await axios.post("/api/baidu-ocr", { images: base64List });
+      const ocrResults = res.data.results;
+
+      let tempResults = [];
+      ocrResults.forEach((ocr, idx) => {
+        // 拼接所有行文本
+        const text = ocr.words_result?.map(w => w.words).join('\n') || '';
         const info = extractInfo(text);
         tempResults.push({
-          filename: files[i].name,
-          amount: info.amount,
+          filename: files[idx].name,
+          amountDiscount: info.amountDiscount,
+          amountPaid: info.amountPaid,
           orderId: info.orderId,
           raw: text
         });
-        // 如果只识别一张图片，保存原文
         if (files.length === 1) setSingleRawText(text);
-      } catch {
-        tempResults.push({
-          filename: files[i].name,
-          amount: "识别失败",
-          orderId: "识别失败",
-          raw: ""
-        });
-        if (files.length === 1) setSingleRawText("");
-      }
-      setProgress(Math.round(((i + 1) / files.length) * 100));
+      });
+      setResults(tempResults);
+    } catch (e) {
+      setResults(files.map(f => ({
+        filename: f.name,
+        amountDiscount: "识别失败",
+        amountPaid: "识别失败",
+        orderId: "识别失败",
+        raw: ""
+      })));
+      setSingleRawText("");
     }
-    setResults(tempResults);
     setLoading(false);
+    setProgress(100);
   };
 
   const handleExportExcel = () => {
     const data = results.map((r, idx) => ({
       序号: idx + 1,
       文件名: r.filename,
-      实付金额: r.amount,
+      商品金额: r.amountDiscount,
+      实付金额: r.amountPaid,
       订单编号: r.orderId
     }));
     const ws = XLSX.utils.json_to_sheet(data);
@@ -143,6 +209,7 @@ export default function Home() {
                   <tr>
                     <th className="px-2 py-1 border">序号</th>
                     <th className="px-2 py-1 border">文件名</th>
+                    <th className="px-2 py-1 border">商品金额</th>
                     <th className="px-2 py-1 border">实付金额</th>
                     <th className="px-2 py-1 border">订单编号</th>
                   </tr>
@@ -152,7 +219,8 @@ export default function Home() {
                     <tr key={idx} className="hover:bg-green-100">
                       <td className="px-2 py-1 border">{idx + 1}</td>
                       <td className="px-2 py-1 border">{r.filename}</td>
-                      <td className="px-2 py-1 border">{r.amount}</td>
+                      <td className="px-2 py-1 border">{r.amountDiscount}</td>
+                      <td className="px-2 py-1 border">{r.amountPaid}</td>
                       <td className="px-2 py-1 border">{r.orderId}</td>
                     </tr>
                   ))}
